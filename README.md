@@ -1,117 +1,105 @@
-# My Simple Dashboard (Finance Streamlit Dashboard)
+# Finance Streamlit Dashboard
 
-A minimal Streamlit dashboard template that generates example time-series data and provides basic filters, charts, and data download functionality. This project is intended as a starting point for visualizing financial or time-series datasets.
+This repository contains a Streamlit dashboard template for exploring time-series and event-driven financial data. There are two Streamlit apps in the repo:
 
----
+- `app.py` — a simple template dashboard that generates example time-series data and demonstrates filters, charts, and CSV export.
+- `storage_old.py` (and other supporting files) — a more advanced "Senator Trades Event Study" dashboard that loads `results_df.csv`, computes event-study metrics, fetches news via Marketaux, and can summarize news using the Google Gemini API.
 
-## Features
+Use this README to get the app running locally, understand the required data/keys, and customize the dashboards.
 
-- Interactive date range filter and category selector in the sidebar.
-- Metric selector to switch between `value` and `volume`.
-- Top-level metrics (Total, Average, Last-day comparison).
-- Tabs for Overview (time-series and category charts), Details (aggregations + CSV download), and Raw Data.
-- Example data generator in `load_data()` — replace with your own data source.
-- Caching via `@st.cache_data` for faster reloads.
+**Key files**
+- `app.py`: Simple example dashboard (time-series generator, sidebar controls, charts, CSV download).
+- `storage_old.py`: Senator Trades Event Study dashboard (market event processing, Marketaux news fetcher, Gemini summarizer).
+- `results_df.csv`: Required by the event-study app (`storage_old.py`) — contains event/windowed returns and AR/CAR fields.
+- `requirements.txt`: List of Python dependencies used by the project.
 
----
+**Features (combined)**
+- Interactive sidebar filters (date range, categories, party, senator, event window).
+- Time-series and bar charts, aggregated views, raw data exploration, and CSV download.
+- Event-study computation (AR/CAR/SCAR) and per-event cumulative return metrics.
+- News fetching via Marketaux and optional summarization via Google Gemini (requires API keys).
 
-## Prerequisites
+**Prerequisites**
+- Python 3.8+
+- Git (optional)
 
-- Python 3.8 or newer
-- Windows PowerShell (instructions below assume PowerShell)
+**Install (recommended)**
+1. From the project root (`c:\Users\Owner\Documents\finance_streamlit_dashboard`), create and activate a virtual environment (PowerShell):
 
----
-
-## Install
-
-From the project root (`c:\Users\Owner\Documents\finance_streamlit_dashboard`):
-
-1. Create and activate a virtual environment (PowerShell):
-
-```
+```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-If PowerShell blocks script execution, you can run (as Administrator) to allow local scripts:
+If PowerShell blocks script execution, run (as Administrator) to allow local scripts:
 
-```
+```powershell
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 ```
 
-2. Upgrade `pip` and install dependencies:
+2. Install dependencies:
 
-```
+```powershell
 python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+If you prefer to install only the minimal packages for `app.py`, run:
+
+```powershell
 pip install streamlit pandas numpy
 ```
 
-Optionally, create a `requirements.txt`:
+**Environment variables / API keys**
+- `GEMINI_API_KEY`: (optional) Google Gemini API key used by `storage_old.py` for summarization. The app uses the `google-generativeai` package.
+- `MARKETAUX_API_KEY`: (optional) Marketaux API key used to fetch news articles for tickers.
 
+Set environment variables on Windows PowerShell like:
+
+```powershell
+$env:GEMINI_API_KEY = 'your_gemini_key_here'
+$env:MARKETAUX_API_KEY = 'your_marketaux_key_here'
 ```
-pip freeze > requirements.txt
-```
 
----
+To persist them across sessions, add them to your system environment variables or your PowerShell profile.
 
-## Run the app
+**Run the dashboards**
 
-From the project root (with the venv activated):
+To run the simple example app:
 
-```
+```powershell
 streamlit run app.py
+```
+
+To run the event-study / news summarizer app (if you have `results_df.csv` and API keys):
+
+```powershell
+streamlit run storage_old.py
 ```
 
 Streamlit will print a local URL (e.g., `http://localhost:8501`) — open it in your browser.
 
----
+**Data: `results_df.csv`**
+- Place `results_df.csv` in the project root (next to `app.py`) to use the Senator Trades event-study app. The app expects columns like `event_id`, `ticker`, `event_date`, `Offset`, `Ret`, and optionally `ar`, `car`, `scar`.
 
-## How it works / Where to customize
+**Notes on customization**
+- Replace the example data generator in `app.py` (`load_data`) with your own data loader (CSV, database, API).
+- The event-study logic in `storage_old.py` computes per-event cumulative returns and aggregates by senator; edit the grouping window or metrics as required.
+- Charts are Streamlit-native; swap to Altair/Plotly if you need more advanced visuals.
 
-- `app.py` contains all the UI and example data generation.
-- Replace the `load_data()` function with your own data loader (e.g., from CSV, database, or API).
-- Charts use Streamlit's built-in `line_chart` and `bar_chart`. Replace with Altair or Plotly for more control.
-- The date column is converted to pandas `datetime` for reliable filtering (`df['date'] = pd.to_datetime(df['date'])`).
-- Caching is applied to `load_data()` via `@st.cache_data` to avoid reloading on every interaction.
-
-Helpful places to edit:
-- Sidebar controls: search for `st.sidebar` to add filters or inputs.
-- Metrics and tabs: near the top-level metrics and `st.tabs(...)` blocks.
-
----
-
-## Example usage notes
-
-- Use the sidebar to select a date range and categories to filter the dashboard.
-- The "Metric to visualize" selector toggles between `value` and `volume` and updates all charts/metrics.
-- Use the Download button under the Details tab to export the filtered dataset as CSV.
-
----
-
-## Troubleshooting
-
-- `ModuleNotFoundError: No module named 'streamlit'` — ensure the venv is activated and run `pip install streamlit`.
+**Troubleshooting**
+- `ModuleNotFoundError: No module named 'streamlit'` — ensure the venv is activated and run `pip install -r requirements.txt`.
 - Streamlit port already in use — stop the other instance or run `streamlit run app.py --server.port 8502`.
-- PowerShell script execution prevented — enable local scripts with `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`.
+- If Marketaux or Gemini calls fail, ensure the corresponding API keys are set and have valid credits/permissions.
 
----
+**Contributing & Next steps**
+- Add a `LICENSE` file if you plan to publish the project.
+- Add tests or a sample `results_df.csv` with synthetic data for easier local testing.
+- Consider splitting the large Streamlit app into smaller modules and adding a `procfile` / Dockerfile for deployment.
 
-## Contributing
+If you want, I can:
+- add a small example `results_df.csv` with synthetic data,
+- create a `Dockerfile` or GitHub Actions workflow to deploy the app,
+- or update `requirements.txt` to pin specific versions.
 
-Feel free to open issues or submit pull requests. Suggestions:
-
-- Add a `requirements.txt` or `pyproject.toml` for reproducible installs.
-- Replace the fake data generator with connectors to real data sources.
-- Add unit tests or a lightweight data validation step for inputs.
-
----
-
-## License
-
-Add a license file (e.g., `LICENSE`) if you plan to publish this project. No license is included by default.
-
----
-
-## Contact
-
-If you'd like changes to this README (more examples, badges, or CI instructions), tell me what you'd like added and I will update it.
+Tell me which of these you'd like next.
