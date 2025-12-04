@@ -1,8 +1,17 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-from datetime import datetime
+import os
 from pathlib import Path
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+
+# --- OPTIONAL: Gemini (google-generativeai) ---
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 # -------------------------------------------------
 # PAGE CONFIG
@@ -15,15 +24,25 @@ st.set_page_config(
 
 st.title("🏛️ Senator Trades Event Study Dashboard")
 st.caption(
-    "Analyze stock performance around senators' trades using event-study data."
+    "Analyze stock performance around senators' trades using event-study data, "
+    "and optionally generate Gemini summaries of news after each trade."
 )
 
 # -------------------------------------------------
-# DATA LOADING
+# CONFIG: PATHS & KEYS
 # -------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 CSV_PATH = BASE_DIR / "results_df.csv"   # adjust if you put it in a subfolder
 
+GEMINI_API_KEY = os.getenv("AIzaSyBB4cs2uQ0bAqQ3L0b6V__lgt-3UuOGebQ")
+NEWSAPI_KEY = os.getenv("c2a194837562496182e6cc3e94f700d4")
+
+if genai is not None and GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+# -------------------------------------------------
+# DATA LOADING
+# -------------------------------------------------
 @st.cache_data
 def load_event_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -53,8 +72,7 @@ def load_event_data(path: str) -> pd.DataFrame:
 if not CSV_PATH.exists():
     st.error(
         f"Could not find results_df.csv at {CSV_PATH}. "
-        "Make sure it is committed to the GitHub repo in the same folder as app.py "
-        "or adjust CSV_PATH in the code."
+        "Make sure it is in the repo next to app.py or adjust CSV_PATH."
     )
     st.stop()
 
@@ -108,6 +126,97 @@ def compute_senator_overall_stats(
 
     return pd.DataFrame(rows)
 
+# -------------------------------------------------
+# NEWS + GEMINI HELPERS
+# -------------------------------------------------
+@st.cache_data(show_spinner=False)
+def fetch_news_articles(ticker: str, start_dt: datetime, end_dt: datetime, api_key: str):
+    """
+    Fetch news articles for a ticker between start_dt and end_dt using NewsAPI.
+    Returns a list of simple dicts (title, description, url, publishedAt).
+    """
+    if not api_key:
+        return []
+
+    url = "https://newsapi.org/v2/everything"
+    params = {
+        "q": ticker,
+        "from": start_dt.strftime("%Y-%m-%d"),
+        "to": end_dt.strftime("%Y-%m-%d"),
+        "sortBy": "publishedAt",
+        "language": "en",
+        "pageSize": 20,
+        "apiKey": api_key,
+    }
+
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        articles = data.get("articles", [])
+    except Exception:
+        return []
+
+    simplified = []
+    for a in articles:
+        simplified.append(
+            {
+                "title": a.get("title"),
+                "description": a.get("description"),
+                "source": a.get("source", {}).get("name"),
+                "url": a.get("url"),
+                "publishedAt": a.get("publishedAt"),
+            }
+        )
+    return simplified
+
+
+@st.cache_data(show_spinner=False)
+def summarize_news_with_gemini(
+    ticker: str,
+    event_date: datetime,
+    articles: list,
+    holding_period_days: int,
+):
+    """
+    Use Gemini to create a concise narrative of what happened after the trade.
+    """
+    if genai is None or not GEMINI_API_KEY:
+        return (
+            "Gemini is not configured. Install `google-generativeai` and set "
+            "the GEMINI_API_KEY environment variable."
+        )
+
+    if not articles:
+        return (
+            f"No news articles were found for {ticker} after {event_date}. "
+            "There may have been little coverage or the news API limits were reached."
+        )
+
+    model = genai.GenerativeModel("gemini-1.5-pro")
+
+    # Keep prompt short & focused
+    prompt = f"""
+You are an equity analyst. A U.S. senator executed a trade in {ticker} on {event_date}.
+You are given news headlines and descriptions about {ticker} and the broader market
+from the days after the trade (up to about {holding_period_days} days).
+
+Write a concise 3–6 sentence summary that answers:
+
+1. What major company-specific news (earnings, guidance, product news, legal issues, management changes, etc.) occurred after the trade?
+2. What notable macro / sector or economic data releases might explain moves in the stock?
+3. Did the overall tone of the news look positive, negative, or mixed for the stock?
+
+Focus on *post-trade* developments only. Do not speculate beyond the articles.
+Here are the articles as JSON:
+{articles}
+""".strip()
+
+    try:
+        resp = model.generate_content(prompt)
+        return resp.text.strip()
+    except Exception as e:
+        return f"Gemini request failed: {e}"
 
 # -------------------------------------------------
 # SIDEBAR CONTROLS
@@ -146,6 +255,14 @@ start_offset, end_offset = st.sidebar.slider(
     value=(default_start, default_end),
 )
 
+# News look-ahead window (for Gemini / news summary)
+news_window_days = st.sidebar.slider(
+    "News look-ahead window (days after trade for news scan)",
+    min_value=1,
+    max_value=30,
+    value=10,
+)
+
 # Event selection: (event_id, ticker, event_date)
 event_list = (
     df_senator[["event_id", "ticker", "event_date"]]
@@ -168,7 +285,6 @@ event_id_mapping = {
 selected_event_label = st.sidebar.selectbox("Select trade / event", options=event_labels)
 selected_event_id = event_id_mapping[selected_event_label]
 
-
 # -------------------------------------------------
 # OVERALL SENATOR PERFORMANCE
 # -------------------------------------------------
@@ -186,7 +302,6 @@ else:
     avg_stock = overall_stats["stock_cum_return"].mean()
     med_stock = overall_stats["stock_cum_return"].median()
     avg_car = overall_stats["car_end"].mean()
-    avg_scar = overall_stats["scar_end"].mean()
     n_events = len(overall_stats)
 
     col1.metric(
@@ -267,10 +382,15 @@ ec3.metric(
 )
 
 # -------------------------------------------------
-# PLOTS & DATA
+# PLOTS & DATA & NEWS
 # -------------------------------------------------
-tab1, tab2, tab3 = st.tabs(
-    ["📈 Cumulative Return", "📊 AR / CAR / SCAR", "📄 Event Data"]
+tab1, tab2, tab3, tab4 = st.tabs(
+    [
+        "📈 Cumulative Return",
+        "📊 AR / CAR / SCAR",
+        "📄 Event Data",
+        "📰 News / Context (Gemini)",
+    ]
 )
 
 with tab1:
@@ -321,7 +441,52 @@ with tab3:
         use_container_width=True,
     )
 
+with tab4:
+    st.markdown("### News and Context After the Trade (Gemini)")
+
+    if not NEWSAPI_KEY:
+        st.warning(
+            "NEWSAPI_KEY environment variable is not set. "
+            "Sign up at newsapi.org, get an API key, and set it as NEWSAPI_KEY "
+            "to enable this feature."
+        )
+
+    if genai is None or not GEMINI_API_KEY:
+        st.warning(
+            "Gemini is not configured. Install `google-generativeai` and set "
+            "the GEMINI_API_KEY environment variable to enable summaries."
+        )
+
+    st.write(
+        "This tool looks up news about the selected ticker in the days *after* the "
+        "trade date and asks Gemini to summarize what happened."
+    )
+
+    if st.button("Generate news summary with Gemini"):
+        with st.spinner("Fetching news and asking Gemini..."):
+            # Convert event_date (date) to datetime for range handling
+            event_dt = datetime.combine(event_date, datetime.min.time())
+            start_dt = event_dt + timedelta(days=1)  # strictly after trade
+            end_dt = event_dt + timedelta(days=news_window_days)
+
+            articles = fetch_news_articles(
+                event_ticker, start_dt, end_dt, NEWSAPI_KEY
+            )
+            summary = summarize_news_with_gemini(
+                event_ticker, event_date, articles, news_window_days
+            )
+
+        st.markdown("#### Gemini summary")
+        st.write(summary)
+
+        if articles:
+            with st.expander("Show raw news headlines used"):
+                news_df = pd.DataFrame(articles)
+                st.dataframe(news_df, use_container_width=True)
+
 st.markdown("---")
 st.caption(
-    "Use the sidebar to change party, senator, event, and event window to explore different trades."
+    "Use the sidebar to change party, senator, event, and event / news windows to "
+    "explore different trades and their subsequent news flow."
 )
+
