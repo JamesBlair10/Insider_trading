@@ -2,3 +2,6 @@ streamlit
 pandas
 numpy
 yfinance
+google-generativeai
+newsapi-python
+requests
