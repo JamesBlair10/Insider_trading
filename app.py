@@ -34,8 +34,8 @@ st.caption(
 BASE_DIR = Path(__file__).resolve().parent
 CSV_PATH = BASE_DIR / "results_df.csv"   # adjust if you put it in a subfolder
 
-GEMINI_API_KEY = os.getenv("AIzaSyBB4cs2uQ0bAqQ3L0b6V__lgt-3UuOGebQ")
-NEWSAPI_KEY = os.getenv("c2a194837562496182e6cc3e94f700d4")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
 
 if genai is not None and GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
