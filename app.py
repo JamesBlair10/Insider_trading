@@ -1,277 +1,422 @@
-#app.py
-# ---------------------------
-# Simple Streamlit Dashboard
-# ---------------------------
-# Run with:
-#   streamlit run app.py
-#
-# Then open the URL Streamlit prints in your terminal.
+# app.py
+# Event Study Dashboard for Senator Trades
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import date
+import yfinance as yf
 
 # ---------------------------
 # PAGE CONFIG
 # ---------------------------
 st.set_page_config(
-    page_title="My Simple Dashboard",
-    page_icon="📊",
+    page_title="Senator Trades Event Study",
+    page_icon="🏛️",
     layout="wide",
 )
 
+st.title("🏛️ Senator Trades Event Study Dashboard")
+st.caption(
+    "Analyze stock performance around senators' trades and compare to the S&P 500 and Nasdaq."
+)
 
 # ---------------------------
-# DATA GENERATION / LOADING
+# DATA LOADING
 # ---------------------------
+
 @st.cache_data
-def load_data(num_days: int = 60) -> pd.DataFrame:
-    """
-    Creates some example time series data.
-    Replace this function with your own data loading logic later.
-    """
-    np.random.seed(42)
-    today = datetime.today().date()
-    dates = [today - timedelta(days=i) for i in range(num_days)][::-1]
+def load_event_data(csv_path: str = "results_df.csv") -> pd.DataFrame:
+    """Load your precomputed event-study data from CSV."""
+    df = pd.read_csv(csv_path)
 
-    categories = ["Product A", "Product B", "Product C"]
-    rows = []
+    # Clean types
+    df["Date"] = pd.to_datetime(df["Date"]).dt.date
+    df["event_date"] = pd.to_datetime(df["event_date"]).dt.date
 
-    for d in dates:
-        for cat in categories:
-            value = np.random.normal(loc=100, scale=20)
-            value = max(value, 0)  # avoid negative values
-            rows.append(
-                {
-                    "date": d,
-                    "category": cat,
-                    "value": round(value, 2),
-                    "volume": np.random.randint(10, 200),
-                }
-            )
+    # Make event_id an integer if possible
+    if "event_id" in df.columns:
+        try:
+            df["event_id"] = df["event_id"].astype(int)
+        except Exception:
+            pass
 
-    df = pd.DataFrame(rows)
-    # Fix: Convert the 'date' column to pandas datetime objects for consistent comparison
-    df['date'] = pd.to_datetime(df['date'])
+    # Fill missing party if any
+    if "Party" in df.columns:
+        df["Party"] = df["Party"].fillna("Unknown")
+
     return df
 
 
-data = load_data()
-
-
-# ---------------------------
-# SIDEBAR
-# ---------------------------
-st.sidebar.title("Controls ⚙️")
-
-# Date filter
-min_date = data["date"].min()
-max_date = data["date"].max()
-start_date, end_date = st.sidebar.date_input(
-    "Date range",
-    value=(min_date, max_date),
-    min_value=min_date,
-    max_value=max_date,
-)
-
-# Category filter
-all_categories = sorted(data["category"].unique())
-selected_categories = st.sidebar.multiselect(
-    "Categories",
-    options=all_categories,
-    default=all_categories,
-)
-
-# Metric selector (for charts)
-metric = st.sidebar.selectbox("Metric to visualize", ["value", "volume"])
-
-# Sidebar info
-with st.sidebar.expander("About this app"):
-    st.write(
-        """
-        This is a simple Streamlit dashboard template.
-
-        **How to customize:**
-        - Replace the fake data in `load_data()`.
-        - Add or remove charts in the main area.
-        - Adjust sidebar filters and controls.
-        """
+@st.cache_data
+def get_index_returns(start_date: date, end_date: date) -> pd.DataFrame:
+    """
+    Download daily returns for S&P 500 (^GSPC) and Nasdaq (^IXIC)
+    between start_date and end_date using yfinance.
+    """
+    tickers = ["^GSPC", "^IXIC"]
+    data = yf.download(
+        tickers,
+        start=start_date,
+        end=end_date,
+        progress=False,
+        auto_adjust=True,
     )
 
+    # yfinance returns a DataFrame with columns like ('Adj Close', '^GSPC')
+    if isinstance(data.columns, pd.MultiIndex):
+        adj_close = data["Adj Close"].copy()
+    else:
+        # Single index case; assume these are adjusted close prices
+        adj_close = data.copy()
+
+    # Normalize column names
+    col_map = {}
+    for col in adj_close.columns:
+        if "GSPC" in col:
+            col_map[col] = "SP500"
+        elif "IXIC" in col:
+            col_map[col] = "NASDAQ"
+        else:
+            col_map[col] = col
+    adj_close = adj_close.rename(columns=col_map)
+
+    # Compute daily returns
+    ret = adj_close.pct_change().reset_index()
+    ret.rename(columns={"Date": "Date"}, inplace=True)
+    ret["Date"] = ret["Date"].dt.date
+
+    # Keep only what we need
+    expected_cols = []
+    if "SP500" in ret.columns:
+        expected_cols.append("SP500")
+    if "NASDAQ" in ret.columns:
+        expected_cols.append("NASDAQ")
+
+    return ret[["Date"] + expected_cols]
+
+
+@st.cache_data
+def compute_senator_overall_stats(
+    df: pd.DataFrame,
+    idx_ret: pd.DataFrame,
+    senator: str,
+    start_offset: int,
+    end_offset: int,
+) -> pd.DataFrame:
+    """
+    For a given senator and event window, compute cumulative event-window returns
+    for each event, and summarize averages.
+    """
+    df_sen = df[df["senator"] == senator].copy()
+
+    # Merge index returns for all relevant dates once
+    merged = df_sen.merge(idx_ret, on="Date", how="left")
+
+    # Ensure offsets are within full range
+    merged = merged[
+        (merged["Offset"] >= start_offset) & (merged["Offset"] <= end_offset)
+    ]
+
+    # Group by event
+    event_groups = merged.groupby(["event_id", "ticker", "event_date"], as_index=False)
+
+    summary_rows = []
+    for (event_id, ticker, event_date), g in event_groups:
+        g_sorted = g.sort_values("Date")
+
+        # Stock cumulative return in the window
+        stock_cum = (1 + g_sorted["Ret"].fillna(0)).prod() - 1
+
+        # SP500
+        if "SP500" in g_sorted.columns:
+            sp500_cum = (1 + g_sorted["SP500"].fillna(0)).prod() - 1
+        else:
+            sp500_cum = np.nan
+
+        # NASDAQ
+        if "NASDAQ" in g_sorted.columns:
+            nasdaq_cum = (1 + g_sorted["NASDAQ"].fillna(0)).prod() - 1
+        else:
+            nasdaq_cum = np.nan
+
+        summary_rows.append(
+            {
+                "event_id": event_id,
+                "ticker": ticker,
+                "event_date": event_date,
+                "stock_cum_return": stock_cum,
+                "sp500_cum_return": sp500_cum,
+                "nasdaq_cum_return": nasdaq_cum,
+                "excess_vs_sp500": stock_cum - sp500_cum
+                if pd.notna(sp500_cum)
+                else np.nan,
+                "excess_vs_nasdaq": stock_cum - nasdaq_cum
+                if pd.notna(nasdaq_cum)
+                else np.nan,
+            }
+        )
+
+    if not summary_rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(summary_rows)
+
 
 # ---------------------------
-# FILTER DATA
+# LOAD DATA
 # ---------------------------
-filtered_data = data.copy()
 
-# Apply date filter
-if isinstance(start_date, tuple):
-    # Streamlit can return (start, end) for date_input in some versions
-    start_date, end_date = start_date
+try:
+    data = load_event_data("results_df.csv")  # change path if needed
+except FileNotFoundError:
+    st.error(
+        "Could not find `results_df.csv`. "
+        "Place it in the same folder as `app.py` or adjust the path in `load_event_data()`."
+    )
+    st.stop()
 
-filtered_data = filtered_data[
-    (filtered_data["date"] >= pd.to_datetime(start_date))
-    & (filtered_data["date"] <= pd.to_datetime(end_date))
+min_date = data["Date"].min()
+max_date = data["Date"].max()
+
+# Pre-load index returns for the full date range of your study
+with st.spinner("Fetching S&P 500 and Nasdaq data..."):
+    index_returns = get_index_returns(min_date, max_date)
+
+# ---------------------------
+# SIDEBAR CONTROLS
+# ---------------------------
+
+st.sidebar.header("Filters")
+
+# Party filter
+parties = sorted(data["Party"].dropna().unique().tolist())
+selected_party = st.sidebar.multiselect(
+    "Party",
+    options=parties,
+    default=parties,  # show all by default
+)
+
+df_party = data[data["Party"].isin(selected_party)] if selected_party else data.copy()
+
+# Senator selection
+senators = sorted(df_party["senator"].dropna().unique().tolist())
+
+if not senators:
+    st.warning("No senators available with the current party filter.")
+    st.stop()
+
+selected_senator = st.sidebar.selectbox("Senator", options=senators)
+
+df_senator = df_party[df_party["senator"] == selected_senator].copy()
+
+# Event window selection (in days relative to event_date)
+min_offset = int(df_senator["Offset"].min())
+max_offset = int(df_senator["Offset"].max())
+
+start_offset, end_offset = st.sidebar.slider(
+    "Event window (days from event date)",
+    min_value=min_offset,
+    max_value=max_offset,
+    value=(-5, 5),
+)
+
+# Event selection: unique (event_id, ticker, event_date) combos
+event_list = (
+    df_senator[["event_id", "ticker", "event_date"]]
+    .drop_duplicates()
+    .sort_values(["event_date", "ticker", "event_id"])
+)
+
+if event_list.empty:
+    st.warning("No events available for this senator.")
+    st.stop()
+
+event_labels = [
+    f"Event {int(row.event_id)} | {row.ticker} | {row.event_date}"
+    for _, row in event_list.iterrows()
 ]
+event_id_mapping = {
+    label: int(row.event_id) for label, (_, row) in zip(event_labels, event_list.iterrows())
+}
 
-# Apply category filter
-if selected_categories:
-    filtered_data = filtered_data[filtered_data["category"].isin(selected_categories)]
+selected_event_label = st.sidebar.selectbox("Select trade/event", options=event_labels)
+selected_event_id = event_id_mapping[selected_event_label]
+
+# ---------------------------
+# SELECTED EVENT DATA
+# ---------------------------
+
+event_df = df_senator[df_senator["event_id"] == selected_event_id].copy()
+event_df = event_df.sort_values("Date")
+
+# Merge with index returns
+event_merged = event_df.merge(index_returns, on="Date", how="left")
+
+# Apply event window offsets
+event_window = event_merged[
+    (event_merged["Offset"] >= start_offset) & (event_merged["Offset"] <= end_offset)
+].copy()
+
+if event_window.empty:
+    st.warning("No data in the chosen event window for this event.")
+    st.stop()
+
+# Identify ticker and event date for display
+event_ticker = event_window["ticker"].iloc[0]
+event_date = event_window["event_date"].iloc[0]
+party = event_window["Party"].iloc[0]
 
 
 # ---------------------------
-# HEADER
+# TOP SUMMARY / OVERALL STATS
 # ---------------------------
-st.title("📊 My Simple Dashboard")
-st.caption("Use this as a starting point and customize it for your own data.")
 
+st.subheader("Summary for Selected Senator")
 
-# ---------------------------
-# TOP-LEVEL METRICS
-# ---------------------------
-col1, col2, col3 = st.columns(3)
+overall_stats = compute_senator_overall_stats(
+    data, index_returns, selected_senator, start_offset, end_offset
+)
 
-with col1:
-    total_metric = filtered_data[metric].sum()
-    st.metric(
-        label=f"Total {metric.capitalize()}",
-        value=f"{total_metric:,.0f}",
+col1, col2, col3, col4, col5 = st.columns(5)
+
+if not overall_stats.empty:
+    avg_stock = overall_stats["stock_cum_return"].mean()
+    avg_sp500 = overall_stats["sp500_cum_return"].mean()
+    avg_nasdaq = overall_stats["nasdaq_cum_return"].mean()
+    avg_excess_sp = overall_stats["excess_vs_sp500"].mean()
+    avg_excess_nd = overall_stats["excess_vs_nasdaq"].mean()
+
+    col1.metric(
+        "Avg Stock Return (Event Window)",
+        f"{avg_stock * 100:,.2f}%",
     )
-
-with col2:
-    avg_metric = filtered_data[metric].mean()
-    st.metric(
-        label=f"Average {metric.capitalize()}",
-        value=f"{avg_metric:,.1f}",
+    col2.metric(
+        "Avg S&P 500 Return (Event Window)",
+        f"{avg_sp500 * 100:,.2f}%",
     )
-
-with col3:
-    # Last day vs previous day comparison (if enough data)
-    latest_date = filtered_data["date"].max()
-    prev_date = latest_date - timedelta(days=1)
-
-    latest_val = filtered_data.loc[
-        filtered_data["date"] == latest_date, metric
-    ].sum()
-
-    prev_val = filtered_data.loc[
-        filtered_data["date"] == prev_date, metric
-    ].sum()
-
-    delta = latest_val - prev_val if not np.isnan(prev_val) else 0
-    st.metric(
-        label=f"{metric.capitalize()} (last day)",
-        value=f"{latest_val:,.0f}",
-        delta=f"{delta:,.0f}",
+    col3.metric(
+        "Avg Nasdaq Return (Event Window)",
+        f"{avg_nasdaq * 100:,.2f}%",
     )
+    col4.metric(
+        "Avg Excess vs S&P 500",
+        f"{avg_excess_sp * 100:,.2f}%",
+    )
+    col5.metric(
+        "Avg Excess vs Nasdaq",
+        f"{avg_excess_nd * 100:,.2f}%",
+    )
+else:
+    col1.info("Not enough data to compute senator-level stats for this window.")
 
+
+st.markdown("---")
 
 # ---------------------------
-# MAIN TABS
+# SELECTED EVENT DETAILS
 # ---------------------------
-tab_overview, tab_details, tab_raw = st.tabs(
-    ["📈 Overview", "📊 Details", "📄 Raw Data"]
+
+st.subheader("Selected Event Details")
+
+st.write(
+    f"**Senator:** {selected_senator}  "
+    f" | **Party:** {party}  "
+    f" | **Ticker:** `{event_ticker}`  "
+    f" | **Event Date:** {event_date}  "
+    f" | **Event ID:** {selected_event_id}  "
+)
+
+# Compute cumulative returns for the event window
+event_window = event_window.sort_values("Offset")
+
+event_window["stock_cum_ret"] = (1 + event_window["Ret"].fillna(0)).cumprod() - 1
+
+if "SP500" in event_window.columns:
+    event_window["sp500_cum_ret"] = (
+        (1 + event_window["SP500"].fillna(0)).cumprod() - 1
+    )
+else:
+    event_window["sp500_cum_ret"] = np.nan
+
+if "NASDAQ" in event_window.columns:
+    event_window["nasdaq_cum_ret"] = (
+        (1 + event_window["NASDAQ"].fillna(0)).cumprod() - 1
+    )
+else:
+    event_window["nasdaq_cum_ret"] = np.nan
+
+# ---------------------------
+# EVENT-LEVEL METRICS
+# ---------------------------
+
+final_row = event_window.iloc[-1]
+
+ec1, ec2, ec3 = st.columns(3)
+ec1.metric(
+    "Stock Cumulative Return (Selected Event)",
+    f"{final_row['stock_cum_ret'] * 100:,.2f}%",
+)
+ec2.metric(
+    "S&P 500 Cumulative Return (Same Window)",
+    f"{final_row['sp500_cum_ret'] * 100:,.2f}%",
+)
+ec3.metric(
+    "Nasdaq Cumulative Return (Same Window)",
+    f"{final_row['nasdaq_cum_ret'] * 100:,.2f}%",
 )
 
 
 # ---------------------------
-# OVERVIEW TAB
+# PLOTS
 # ---------------------------
-with tab_overview:
-    st.subheader("Trend over Time")
 
-    if filtered_data.empty:
-        st.warning("No data available for the selected filters.")
+tab1, tab2, tab3 = st.tabs(
+    ["📈 Stock vs Indexes", "📊 AR & CAR", "📄 Event Data Table"]
+)
+
+with tab1:
+    st.markdown("### Cumulative Returns Around the Event")
+
+    plot_df = event_window[["Offset", "stock_cum_ret", "sp500_cum_ret", "nasdaq_cum_ret"]].copy()
+    plot_df = plot_df.set_index("Offset")
+
+    st.line_chart(plot_df)
+
+with tab2:
+    st.markdown("### Abnormal Returns (AR) and Cumulative Abnormal Returns (CAR)")
+
+    if "ar" in event_window.columns and "car" in event_window.columns:
+        ar_car_df = event_window[["Offset", "ar", "car"]].copy()
+        ar_car_df = ar_car_df.set_index("Offset")
+        st.line_chart(ar_car_df)
     else:
-        # Time series chart – simple line chart by date
-        # You can customize or replace this with Altair/Plotly if you want.
-        ts = (
-            filtered_data.groupby("date")[metric]
-            .sum()
-            .reset_index()
-            .sort_values("date")
-        )
-        ts = ts.set_index("date")
+        st.info("AR and CAR columns not found in the data.")
 
-        st.line_chart(ts, height=350)
-
-        st.markdown("---")
-
-        st.subheader("By Category")
-
-        # Aggregate by category for a bar chart
-        by_cat = filtered_data.groupby("category")[metric].sum().reset_index()
-        by_cat = by_cat.set_index("category")
-
-        st.bar_chart(by_cat, height=350)
-
-
-# ---------------------------
-# DETAILS TAB
-# ---------------------------
-with tab_details:
-    st.subheader("Aggregated View")
-
-    agg_type = st.radio(
-        "Aggregation level",
-        ["Daily by Category", "Overall by Category"],
-        horizontal=True,
+with tab3:
+    st.markdown("### Underlying Event Data")
+    st.dataframe(
+        event_window[
+            [
+                "Date",
+                "Offset",
+                "Ret",
+                "SP500",
+                "NASDAQ",
+                "stock_cum_ret",
+                "sp500_cum_ret",
+                "nasdaq_cum_ret",
+                "ar",
+                "car",
+                "sar",
+                "scar",
+            ]
+        ],
+        use_container_width=True,
     )
 
-    if agg_type == "Daily by Category":
-        grouped = (
-            filtered_data.groupby(["date", "category"])[metric]
-            .sum()
-            .reset_index()
-            .sort_values(["date", "category"])
-        )
-        st.dataframe(grouped, use_container_width=True, height=350)
-    else:
-        grouped = (
-            filtered_data.groupby("category")[metric]
-            .agg(["sum", "mean", "min", "max"])
-            .reset_index()
-        )
-        grouped.columns = [
-            "Category",
-            f"Total {metric}",
-            f"Avg {metric}",
-            f"Min {metric}",
-            f"Max {metric}",
-        ]
-        st.dataframe(grouped, use_container_width=True, height=350)
-
-    st.markdown("---")
-    st.subheader("Download Data")
-
-    csv = filtered_data.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download filtered data as CSV",
-        data=csv,
-        file_name="filtered_data.csv",
-        mime="text/csv",
-    )
-
-
-# ---------------------------
-# RAW DATA TAB
-# ---------------------------
-with tab_raw:
-    st.subheader("Raw Data (Unfiltered & Filtered)")
-
-    st.markdown("**Filtered data (based on sidebar controls):**")
-    st.dataframe(filtered_data, use_container_width=True, height=350)
-
-    with st.expander("Show full raw dataset (ignores filters)"):
-        st.dataframe(data, use_container_width=True, height=350)
-
-
-# ---------------------------
-# FOOTER / NOTES
-# ---------------------------
 st.markdown("---")
 st.caption(
-    "Template built with ❤️ using Streamlit. "
-    "Edit `app1.py` to connect to your own data and customize the layout."
+    "Tip: adjust the event window in the sidebar to see how results change. "
+    "You can also change party and senator to explore different trading patterns."
 )
